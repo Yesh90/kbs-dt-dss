@@ -1,98 +1,46 @@
 {
-  "n_firms": 12205,
-  "n_train": 7901,
-  "n_test": 4304,
+  "ventures_total": 63153,
+  "kg_2008": {
+    "nodes": 341,
+    "edges": 9784
+  },
+  "kg_2010": {
+    "nodes": 465,
+    "edges": 17538,
+    "source_ventures": 21335,
+    "ontology_coverage": 0.3311827956989247
+  },
+  "ranker_train_cases": 3645,
+  "completion_test_cases": 23108,
+  "labelled_train": 7901,
+  "labelled_test": 4304,
   "success_rate_train": 0.631818757119352,
   "success_rate_test": 0.45144052044609667,
-  "kg_nodes": 465,
-  "kg_edges": 17538,
-  "ontology_pillars": 9,
-  "ontology_coverage_categories": 0.3311827956989247,
-  "recommendation": {
-    "n_firms": 300,
-    "mean_top1_predicted_gain": 0.11812063485738719,
-    "control_random_best_of_3_mean_gain": 0.04593418805317306,
-    "share_kbdss_beats_control": 0.85,
-    "median_top1_predicted_gain": 0.09840780528629837,
-    "share_positive_gain": 0.9833333333333333,
-    "examples": [
-      {
-        "firm_categories": [
-          "Marketplaces",
-          "Social Media",
-          "Social Media Marketing"
-        ],
-        "predicted_success": 0.227,
-        "recommendations": [
-          {
-            "add": "Social Commerce",
-            "kg_plausibility": 0.674,
-            "predicted_gain": 0.137
-          },
-          {
-            "add": "Crowdsourcing",
-            "kg_plausibility": 0.694,
-            "predicted_gain": 0.068
-          },
-          {
-            "add": "Brand Marketing",
-            "kg_plausibility": 0.757,
-            "predicted_gain": 0.05
-          }
-        ]
-      },
-      {
-        "firm_categories": [
-          "Advertising",
-          "App Marketing",
-          "Mobile",
-          "QR Codes"
-        ],
-        "predicted_success": 0.169,
-        "recommendations": [
-          {
-            "add": "Apps",
-            "kg_plausibility": 0.649,
-            "predicted_gain": 0.036
-          },
-          {
-            "add": "SMS",
-            "kg_plausibility": 0.64,
-            "predicted_gain": 0.017
-          },
-          {
-            "add": "Online Video Advertising",
-            "kg_plausibility": 0.639,
-            "predicted_gain": 0.002
-          }
-        ]
-      },
-      {
-        "firm_categories": [
-          "Consumers",
-          "Curated Web",
-          "Enterprises",
-          "Lead Generation"
-        ],
-        "predicted_success": 0.333,
-        "recommendations": [
-          {
-            "add": "Accounting",
-            "kg_plausibility": 0.651,
-            "predicted_gain": 0.085
-          },
-          {
-            "add": "Crowdsourcing",
-            "kg_plausibility": 0.686,
-            "predicted_gain": 0.06
-          },
-          {
-            "add": "Business Services",
-            "kg_plausibility": 0.734,
-            "predicted_gain": 0.038
-          }
-        ]
-      }
-    ]
+  "recommendation_ventures": 1000,
+  "lambda_star": 0.6,
+  "ranker_coefficients": {
+    "Ontology ranker": {
+      "ont_overlap": 0.373,
+      "ont_lift": 0.095,
+      "ont_digital": -0.251,
+      "log_pop": 0.945
+    },
+    "KG ranker": {
+      "kg_cond_mean": -0.13,
+      "kg_cond_max": 0.334,
+      "kg_ppmi": 0.292,
+      "kg_emb_cos": 0.706,
+      "log_pop": 0.718
+    },
+    "KB-DSS ranker": {
+      "kg_cond_mean": -0.096,
+      "kg_cond_max": 0.296,
+      "kg_ppmi": 0.3,
+      "kg_emb_cos": 0.647,
+      "ont_overlap": 0.155,
+      "ont_lift": -0.032,
+      "ont_digital": -0.026,
+      "log_pop": 0.741
+    }
   }
 }

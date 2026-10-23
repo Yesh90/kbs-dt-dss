@@ -2,16 +2,26 @@
 KB-DSS: a knowledge-based AI decision support system for data-driven
 digital transformation (DT) and innovation in entrepreneurial firms.
 
-One file, three layers:
-  1. Data layer       - firm records from the public Crunchbase 2015 export
-  2. Knowledge layer  - (a) an expert DT ontology that maps market categories
-                        to DT pillars, (b) a category knowledge graph learned
-                        from co-occurrence (PPMI + SVD embeddings, success
-                        priors, recombinant novelty)
-  3. Decision layer   - success prediction, knowledge-graph completion, and
-                        success-aware DT recommendations
+Principle: knowledge proposes, data disposes.
+  Data layer       venture records from the public Crunchbase 2015 export
+  Knowledge layer  (a) expert DT ontology: market categories -> 9 DT pillars
+                   (b) category knowledge graph (KG) learned from co-occurrence:
+                       conditional transitions, PPMI, SVD embeddings, success priors
+  Decision layer   (1) knowledge-guided option generation: a learned ranker scores
+                       every category as a plausible next DT move for a venture
+                   (2) success estimation: gradient-boosted venture-success model
+                   (3) success-aware recommendation: utility
+                       U = (1 - lambda) * plausibility + lambda * predicted gain,
+                       with lambda chosen on a validation cohort
 
-Run:  python kbdss.py            (downloads data, writes results/)
+Protocol (no look-ahead anywhere):
+  ranker   trained on ventures first funded 2009-2010 with a KG built from <=2008
+  models   success model trained on labelled ventures first funded <=2010
+  test     ventures first funded 2011-2015 with a KG built from <=2010
+  outcome  recommendations are scored against REALISED outcomes of other
+           2011-2015 ventures (never used for training)
+
+Run:  python kbdss.py          (downloads data on first run, writes results/)
 """
 from __future__ import annotations
 
@@ -19,33 +29,38 @@ import json
 import os
 import urllib.request
 from collections import Counter
+from functools import lru_cache
 from itertools import combinations
 
 import numpy as np
 import pandas as pd
 from scipy import sparse
+from scipy.stats import wilcoxon
 from sklearn.decomposition import TruncatedSVD
 from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.metrics import average_precision_score, brier_score_loss, roc_auc_score, roc_curve
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
 SEED = 42
-SPLIT_YEAR = 2010            # train: first funding <= 2010, test: 2011-2015
-EMB_DIM = 32
-PRIOR_M = 20                 # Bayesian smoothing strength for success priors
-MIN_CAT = 10                 # minimum firms per category in the knowledge graph
+KG_VAL, SPLIT = 2008, 2010     # KG cut-off for ranker training; train/test split year
+EMB_DIM, MIN_CAT, PRIOR_M = 32, 10, 20
+N_NEG, N_REC = 30, 1000            # ranker negatives, ventures per recommendation benchmark
+MIN_PEERS, SHRINK = 5, 10           # realised-uplift support threshold and shrinkage
 BOOT = 1000
 URL = "https://raw.githubusercontent.com/notpeter/crunchbase-data/master/{}.csv"
 DATA, OUT = "data", "results"
+RNG = np.random.default_rng(SEED)
 
-# --------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 # Knowledge layer (a): expert digital-transformation ontology
-# Each pillar is defined by keyword patterns matched against category names.
-# --------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 ONTOLOGY = {
     "AI & Analytics": ["analytics", "big data", "machine learning", "artificial intelligence", "data mining",
-                       "predictive", "business intelligence", "data visualization", "visualization", "semantic",
-                       "image recognition", "natural language", "databases", "data integration", "optimization"],
+                       "predictive", "business intelligence", "visualization", "semantic", "image recognition",
+                       "natural language", "databases", "data integration", "optimization"],
     "Cloud & Infrastructure": ["cloud", "saas", "paas", "web hosting", "data center", "virtualization", "storage",
                                "infrastructure", "developer api", "developer tools", "application platforms",
                                "open source", "content delivery", "development platforms"],
@@ -61,473 +76,484 @@ ONTOLOGY = {
                 "insurance", "point of sale"],
     "Cybersecurity": ["security", "identity", "privacy", "fraud", "risk management"],
     "IoT & Smart Hardware": ["internet of things", "sensors", "wearables", "home automation", "robotics",
-                             "3d printing", "consumer electronics", "semiconductors", "augmented reality",
-                             "hardware"],
+                             "3d printing", "consumer electronics", "semiconductors", "augmented reality", "hardware"],
     "Digital Content": ["video", "music", "games", "digital media", "content", "publishing", "streaming", "photo",
                         "audio", "television", "news", "blogging"],
 }
 PILLARS = list(ONTOLOGY)
 
 
-def pillars_of(category: str) -> set[str]:
+@lru_cache(maxsize=None)
+def _pillars(category: str) -> tuple:
     c = category.lower()
-    return {p for p, kws in ONTOLOGY.items() if any(k in c for k in kws)}
+    return tuple(any(k in c for k in kws) for kws in ONTOLOGY.values())
 
 
-# --------------------------------------------------------------------------
+def pillar_vector(category: str) -> np.ndarray:
+    return np.array(_pillars(category), dtype=float)
+
+
+# ----------------------------------------------------------------------------
 # Data layer
-# --------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 def load() -> pd.DataFrame:
     os.makedirs(DATA, exist_ok=True)
     for name in ("companies", "rounds"):
-        path = f"{DATA}/{name}.csv"
-        if not os.path.exists(path):
-            urllib.request.urlretrieve(URL.format(name), path)
+        if not os.path.exists(f"{DATA}/{name}.csv"):
+            urllib.request.urlretrieve(URL.format(name), f"{DATA}/{name}.csv")
     c = pd.read_csv(f"{DATA}/companies.csv", encoding="latin1")
     r = pd.read_csv(f"{DATA}/rounds.csv", encoding="latin1")
     r["funded_at"] = pd.to_datetime(r["funded_at"], errors="coerce")
-    first = (r.dropna(subset=["funded_at"]).sort_values("funded_at")
-              .groupby("company_permalink").first()[["funding_round_type", "raised_amount_usd", "funded_at"]])
-    df = c.merge(first, left_on="permalink", right_index=True, how="inner")
+    first = (r.dropna(subset=["funded_at"]).sort_values("funded_at").groupby("company_permalink").first()
+              [["funding_round_type", "raised_amount_usd", "funded_at"]])
+    df = c.merge(first, left_on="permalink", right_index=True)
     df = df[df["category_list"].notna()].copy()
-    df["y"] = df["status"].isin(["acquired", "ipo"]).astype(int)
     df["cats"] = df["category_list"].str.split("|").apply(lambda xs: sorted({x.strip() for x in xs if x.strip()}))
     df["year"] = df["funded_at"].dt.year
     df = df[(df["year"] >= 1995) & (df["year"] <= 2015)]
-    founded = pd.to_datetime(df["founded_at"], errors="coerce")
-    df["lag_years"] = (df["funded_at"] - founded).dt.days / 365.25
+    df["lag_years"] = (df["funded_at"] - pd.to_datetime(df["founded_at"], errors="coerce")).dt.days / 365.25
     df["labeled"] = df["status"].isin(["acquired", "ipo", "closed"])
+    df["y"] = df["status"].isin(["acquired", "ipo"]).astype(int)
     return df.reset_index(drop=True)
 
 
-def base_features(df: pd.DataFrame, top_countries: list[str]) -> pd.DataFrame:
-    """Data-only features available at the time of the first funding round (no outcome leakage)."""
-    X = pd.DataFrame(index=df.index)
-    X["log_first_round"] = np.log1p(df["raised_amount_usd"].fillna(0))
-    X["first_round_missing_amt"] = df["raised_amount_usd"].isna().astype(int)
-    X["first_year"] = df["year"]
-    X["lag_years"] = df["lag_years"].clip(-5, 50)
-    X["n_categories"] = df["cats"].str.len()
-    for t in ["seed", "angel", "venture", "debt_financing", "equity_crowdfunding", "grant", "private_equity"]:
-        X[f"round_{t}"] = (df["funding_round_type"] == t).astype(int)
-    for cc in top_countries:
-        X[f"country_{cc}"] = (df["country_code"] == cc).astype(int)
-    return X
-
-
-def raw_category_features(df: pd.DataFrame, vocab: list[str]) -> pd.DataFrame:
-    """Data-driven but knowledge-free: one-hot of the most frequent raw categories."""
-    idx = {c: i for i, c in enumerate(vocab)}
-    M = np.zeros((len(df), len(vocab)), dtype=np.int8)
-    for row, cats in enumerate(df["cats"]):
-        for c in cats:
-            if c in idx:
-                M[row, idx[c]] = 1
-    return pd.DataFrame(M, index=df.index, columns=[f"cat_{c}" for c in vocab])
-
-
-def ontology_features(df: pd.DataFrame) -> pd.DataFrame:
-    X = pd.DataFrame(0, index=df.index, columns=[f"pillar_{p}" for p in PILLARS])
-    share = np.zeros(len(df))
-    for row, cats in enumerate(df["cats"]):
-        hit = [pillars_of(c) for c in cats]
-        for ps in hit:
-            for p in ps:
-                X.iat[row, PILLARS.index(p)] = 1
-        share[row] = np.mean([bool(h) for h in hit]) if hit else 0.0
-    X["dt_intensity"] = X[[f"pillar_{p}" for p in PILLARS]].sum(1)
-    X["digital_share"] = share
-    X["ai_x_cloud"] = X["pillar_AI & Analytics"] * X["pillar_Cloud & Infrastructure"]
-    X["ai_x_platform"] = X["pillar_AI & Analytics"] * X["pillar_Platforms & Marketplaces"]
-    return X
-
-
-# --------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 # Knowledge layer (b): category knowledge graph
-# --------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 class CategoryKG:
-    """Weighted co-occurrence graph of market categories with PPMI-SVD embeddings."""
+    """Weighted co-occurrence graph G=(V,E) over market categories."""
 
     def __init__(self, cat_lists, min_count=MIN_CAT, dim=EMB_DIM):
         cnt = Counter(c for cats in cat_lists for c in cats)
         self.nodes = sorted(c for c, n in cnt.items() if n >= min_count)
         self.idx = {c: i for i, c in enumerate(self.nodes)}
-        self.freq = np.array([cnt[c] for c in self.nodes], dtype=float)
         n = len(self.nodes)
+        self.freq = np.array([cnt[c] for c in self.nodes], float)
         rows, cols = [], []
         for cats in cat_lists:
             ids = sorted({self.idx[c] for c in cats if c in self.idx})
             for a, b in combinations(ids, 2):
-                rows += [a, b]
-                cols += [b, a]
-        A = sparse.coo_matrix((np.ones(len(rows)), (rows, cols)), shape=(n, n)).tocsr()
-        A.sum_duplicates()
-        self.A = A
-        total = A.sum()
-        deg = np.asarray(A.sum(1)).ravel()
-        A = A.tocoo()
-        pmi = np.log((A.data * total) / (deg[A.row] * deg[A.col] + 1e-12))
-        P = sparse.coo_matrix((np.maximum(pmi, 0), (A.row, A.col)), shape=(n, n)).tocsr()
-        svd = TruncatedSVD(n_components=dim, random_state=SEED)
-        E = svd.fit_transform(P)
+                rows += [a, b]; cols += [b, a]
+        A = sparse.coo_matrix((np.ones(len(rows)), (rows, cols)), shape=(n, n)).toarray()
+        self.A, self.n_edges = A, int((A > 0).sum() // 2)
+        deg = A.sum(1)
+        self.cond = A / np.maximum(deg, 1)[:, None]                         # P(c | s), Eq. (1)
+        pmi = np.log(np.maximum(A * A.sum(), 1e-12) / np.maximum(np.outer(deg, deg), 1e-12))
+        self.ppmi = np.where(A > 0, np.maximum(pmi, 0), 0.0)                 # Eq. (2)
+        E = TruncatedSVD(dim, random_state=SEED).fit_transform(sparse.csr_matrix(self.ppmi))
         self.E = E / (np.linalg.norm(E, axis=1, keepdims=True) + 1e-12)
-        self.degree = deg / (deg.max() + 1e-12)
-        self.n_edges = int(A.nnz // 2)
+        self.centrality = deg / max(deg.max(), 1)
+        self.Pi = np.vstack([pillar_vector(c) for c in self.nodes])          # ontology membership
+        M = self.Pi.T @ A @ self.Pi                                          # ontology-lifted pillar graph
+        self.Q = M / np.maximum(M.sum(1, keepdims=True), 1)
 
     def ids(self, cats):
         return [self.idx[c] for c in cats if c in self.idx]
 
-    def firm_vector(self, cats):
-        ids = self.ids(cats)
-        if not ids:
-            return np.zeros(self.E.shape[1])
+    def firm_vec(self, ids):
         v = self.E[ids].mean(0)
         return v / (np.linalg.norm(v) + 1e-12)
 
-    def novelty(self, cats):
-        """Recombinant novelty: mean pairwise cosine distance between the firm's categories."""
-        ids = self.ids(cats)
+    def novelty(self, ids):
         if len(ids) < 2:
             return 0.0
         S = self.E[ids] @ self.E[ids].T
-        iu = np.triu_indices(len(ids), 1)
-        return float(np.mean(1 - S[iu]))
+        return float(np.mean(1 - S[np.triu_indices(len(ids), 1)]))
 
 
-def success_priors(cat_lists, y, kg, m=PRIOR_M):
-    """Smoothed success rate for every KG node (beta prior centered on the global rate)."""
-    g = float(np.mean(y))
-    s, n = np.zeros(len(kg.nodes)), np.zeros(len(kg.nodes))
-    for cats, yi in zip(cat_lists, y):
-        for i in kg.ids(cats):
-            s[i] += yi
-            n[i] += 1
-    return (s + m * g) / (n + m)
+# ----------------------------------------------------------------------------
+# Decision layer (1): knowledge-guided option generation
+# ----------------------------------------------------------------------------
+KG_FEATS = ["kg_cond_mean", "kg_cond_max", "kg_ppmi", "kg_emb_cos"]
+ONT_FEATS = ["ont_overlap", "ont_lift", "ont_digital"]
+POP_FEATS = ["log_pop"]
 
 
-def kg_features(df, kg, prior):
-    rows = []
+def candidate_features(kg: CategoryKG, ctx: list[int]) -> np.ndarray:
+    """Feature matrix (|V| x 8) scoring every KG node as an addition to context categories ctx."""
+    logpop = np.log1p(kg.freq) / np.log1p(kg.freq).max()
+    fp = kg.Pi[ctx].max(0)                                    # venture's DT pillars
+    n_p = np.maximum(kg.Pi.sum(1), 1)
+    overlap = (kg.Pi @ fp) / n_p
+    lift = (kg.Pi * kg.Q[fp > 0].mean(0)).max(1) if fp.any() else np.zeros(len(kg.nodes))
+    return np.column_stack([kg.cond[ctx].mean(0), kg.cond[ctx].max(0), kg.ppmi[ctx].mean(0),
+                            kg.E @ kg.firm_vec(ctx), overlap, lift, kg.Pi.any(1).astype(float), logpop])
+
+
+FEAT_NAMES = KG_FEATS + ONT_FEATS + POP_FEATS
+RANKERS = {"Ontology ranker": ONT_FEATS + POP_FEATS, "KG ranker": KG_FEATS + POP_FEATS,
+           "KB-DSS ranker": KG_FEATS + ONT_FEATS + POP_FEATS}
+
+
+def hide_one(df, kg, rng):
+    """For ventures with >=2 KG categories, hide one at random (the future 'next move')."""
+    out = []
     for cats in df["cats"]:
         ids = kg.ids(cats)
-        pr = prior[ids] if ids else None
-        rows.append({
-            "kg_prior_mean": pr.mean() if pr is not None else np.nan,
-            "kg_prior_max": pr.max() if pr is not None else np.nan,
-            "kg_prior_min": pr.min() if pr is not None else np.nan,
-            "kg_centrality": kg.degree[ids].mean() if ids else 0.0,
-            "kg_novelty": kg.novelty(cats), "kg_coverage": len(ids) / max(len(cats), 1),
-        })
-    X = pd.DataFrame(rows, index=df.index)
-    V = np.vstack([kg.firm_vector(c) for c in df["cats"]])
-    return pd.concat([X, pd.DataFrame(V, index=df.index, columns=[f"kg_emb_{i}" for i in range(V.shape[1])])], axis=1)
+        if len(ids) >= 2:
+            h = ids[rng.integers(len(ids))]
+            out.append(([i for i in ids if i != h], h))
+    return out
 
 
-def kg_features_oof(train, kg, folds=5):
-    """Out-of-fold success priors on the training set to avoid target leakage."""
-    out = pd.DataFrame(index=train.index)
-    skf = StratifiedKFold(folds, shuffle=True, random_state=SEED)
-    parts = []
-    for tr, va in skf.split(train, train["y"]):
-        pr = success_priors(train["cats"].iloc[tr], train["y"].iloc[tr].values, kg)
-        parts.append(kg_features(train.iloc[va], kg, pr))
-    return pd.concat(parts).loc[out.index]
+def train_rankers(kg, cases, rng):
+    X, y = [], []
+    for ctx, h in cases:
+        F = candidate_features(kg, ctx)
+        pool = np.setdiff1d(np.arange(len(kg.nodes)), ctx + [h])
+        neg = rng.choice(pool, min(N_NEG, len(pool)), replace=False)
+        X.append(F[[h, *neg]]); y += [1] + [0] * len(neg)
+    X = np.vstack(X)
+    models = {}
+    for name, feats in RANKERS.items():
+        cols = [FEAT_NAMES.index(f) for f in feats]
+        models[name] = (cols, make_pipeline(StandardScaler(), LogisticRegression(C=1.0, max_iter=2000)).fit(X[:, cols], y))
+    return models
 
 
-# --------------------------------------------------------------------------
-# Decision layer
-# --------------------------------------------------------------------------
-def model():
-    return HistGradientBoostingClassifier(max_iter=400, learning_rate=0.04, max_leaf_nodes=31,
-                                          min_samples_leaf=40, l2_regularization=1.0,
-                                          early_stopping=True, validation_fraction=0.15, random_state=SEED)
+def score_all(kg, ctx, rankers):
+    F = candidate_features(kg, ctx)
+    s = {"Popularity": kg.freq.astype(float), "Co-occurrence": F[:, 0] + 1e-9 * kg.freq,
+         "KG embedding": F[:, 3] + 1e-9 * kg.freq}
+    for name, (cols, m) in rankers.items():
+        s[name] = m.decision_function(F[:, cols])
+    for v in s.values():
+        v[ctx] = -np.inf
+    return s
 
 
-def boot_ci(y, p, fn, B=BOOT):
-    rng = np.random.default_rng(SEED)
-    vals = []
-    for _ in range(B):
-        i = rng.integers(0, len(y), len(y))
-        if y[i].min() != y[i].max():
-            vals.append(fn(y[i], p[i]))
-    return np.percentile(vals, [2.5, 97.5])
-
-
-def paired_delta(y, p_a, p_b, B=BOOT):
-    rng = np.random.default_rng(SEED)
-    d = []
-    for _ in range(B):
-        i = rng.integers(0, len(y), len(y))
-        if y[i].min() != y[i].max():
-            d.append(roc_auc_score(y[i], p_a[i]) - roc_auc_score(y[i], p_b[i]))
-    d = np.array(d)
-    return float(np.mean(d)), float(np.mean(d <= 0))
-
-
-def kg_completion(test, kg, train_freq, k_list=(5, 10)):
-    """Hide one category per test firm and rank all KG nodes as candidates to recover it."""
-    rng = np.random.default_rng(SEED)
-    pop = train_freq.copy()
-    A = kg.A.toarray()
-    res = {"Popularity": [], "Co-occurrence count": [], "KG embedding (PPMI-SVD)": [], "KB-DSS hybrid (co-occurrence + embedding)": []}
-    deg = A.sum(1) + 1e-12
-    rank01 = lambda v: (np.argsort(np.argsort(v)) / (len(v) - 1))
-    for cats in test["cats"]:
-        ids = kg.ids(cats)
-        if len(ids) < 2:
-            continue
-        hidden = ids[rng.integers(len(ids))]
-        ctx = [i for i in ids if i != hidden]
-        v = kg.E[ctx].mean(0)
-        cond = (A[ctx] / deg[ctx][:, None]).mean(0)              # mean P(candidate | context category)
-        emb = kg.E @ v + 1e-3 * np.log1p(pop) / np.log1p(pop).max()
-        scores = {"Popularity": pop.copy(), "Co-occurrence count": A[ctx].sum(0).astype(float) + 1e-3 * pop / pop.max(),
-                  "KG embedding (PPMI-SVD)": emb,
-                  "KB-DSS hybrid (co-occurrence + embedding)": 0.5 * rank01(cond + 1e-6 * pop) + 0.5 * rank01(emb)}
-        for name, s in scores.items():
-            s = s.copy()
-            s[ctx] = -np.inf
-            rank = int((s > s[hidden]).sum()) + 1
-            res[name].append(rank)
+def completion_benchmark(kg, cases, rankers):
+    ranks = {}
+    for ctx, h in cases:
+        for name, s in score_all(kg, ctx, rankers).items():
+            ranks.setdefault(name, []).append(int((s > s[h]).sum()) + 1)
+    ranks = {k: np.array(v) for k, v in ranks.items()}
+    ref = 1 / ranks["KB-DSS ranker"]
     rows = []
-    for name, ranks in res.items():
-        r = np.array(ranks)
-        rows.append({"Method": name, **{f"Hits@{k}": np.mean(r <= k) for k in k_list}, "MRR": np.mean(1 / r),
-                     "Median rank": float(np.median(r)), "n": len(r)})
+    for name, r in ranks.items():
+        row = {"Method": name, "Hits@1": np.mean(r <= 1), "Hits@5": np.mean(r <= 5), "Hits@10": np.mean(r <= 10),
+               "MRR": np.mean(1 / r), "Median rank": float(np.median(r))}
+        row["p vs KB-DSS"] = np.nan if name == "KB-DSS ranker" else wilcoxon(ref, 1 / r).pvalue
+        rows.append(row)
+    return pd.DataFrame(rows), ranks
+
+
+# ----------------------------------------------------------------------------
+# Decision layer (2): success estimation
+# ----------------------------------------------------------------------------
+class SuccessModel:
+    """Gradient-boosted venture-success estimator on first-round data + knowledge features."""
+
+    def __init__(self, train, kg, use_raw=True, use_ont=True, use_kg=True):
+        self.kg, self.use = kg, (use_raw, use_ont, use_kg)
+        self.countries = train["country_code"].value_counts().head(8).index.tolist()
+        self.vocab = pd.Series([c for cs in train["cats"] for c in cs]).value_counts().head(100).index.tolist()
+        self.vidx = {c: i for i, c in enumerate(self.vocab)}
+        self.g = float(train["y"].mean())
+        self.prior = self._priors(train)
+        X = self._oof_features(train)
+        self.cols = list(X.columns)
+        self.clf = HistGradientBoostingClassifier(max_iter=400, learning_rate=0.04, max_leaf_nodes=31,
+                                                  min_samples_leaf=40, l2_regularization=1.0, early_stopping=True,
+                                                  validation_fraction=0.15, random_state=SEED).fit(X, train["y"])
+
+    def _priors(self, d):
+        s, n = np.zeros(len(self.kg.nodes)), np.zeros(len(self.kg.nodes))
+        for cats, yi in zip(d["cats"], d["y"]):
+            for i in self.kg.ids(cats):
+                s[i] += yi; n[i] += 1
+        return (s + PRIOR_M * self.g) / (n + PRIOR_M)
+
+    def _oof_features(self, train):
+        parts = []
+        for a, b in StratifiedKFold(5, shuffle=True, random_state=SEED).split(train, train["y"]):
+            saved, self.prior = self.prior, self._priors(train.iloc[a])
+            parts.append(self.features(train.iloc[b]))
+            self.prior = saved
+        return pd.concat(parts).loc[train.index]
+
+    def features(self, d, cat_lists=None):
+        cat_lists = list(d["cats"]) if cat_lists is None else cat_lists
+        n = len(cat_lists)
+        rep = lambda col: np.repeat(d[col].values, n // len(d)) if n != len(d) else d[col].values
+        X = {"log_first_round": np.log1p(np.nan_to_num(rep("raised_amount_usd").astype(float))),
+             "first_year": rep("year").astype(float), "lag_years": np.clip(rep("lag_years").astype(float), -5, 50),
+             "n_categories": np.array([len(c) for c in cat_lists], float)}
+        rt = rep("funding_round_type")
+        for t in ["seed", "angel", "venture", "debt_financing", "equity_crowdfunding", "grant", "private_equity"]:
+            X[f"round_{t}"] = (rt == t).astype(float)
+        cc = rep("country_code")
+        for c in self.countries:
+            X[f"country_{c}"] = (cc == c).astype(float)
+        X = pd.DataFrame(X)
+        raw_on, ont_on, kg_on = self.use
+        if raw_on:
+            R = np.zeros((n, len(self.vocab)))
+            for i, cats in enumerate(cat_lists):
+                for c in cats:
+                    if c in self.vidx:
+                        R[i, self.vidx[c]] = 1
+            X = pd.concat([X, pd.DataFrame(R, columns=[f"cat_{c}" for c in self.vocab])], axis=1)
+        if ont_on:
+            P = np.vstack([np.vstack([pillar_vector(c) for c in cats]).max(0) if cats else np.zeros(9) for cats in cat_lists])
+            O = pd.DataFrame(P, columns=[f"pillar_{p}" for p in PILLARS])
+            O["dt_intensity"] = P.sum(1)
+            O["digital_share"] = [np.mean([pillar_vector(c).any() for c in cats]) if cats else 0 for cats in cat_lists]
+            X = pd.concat([X, O], axis=1)
+        if kg_on:
+            K = []
+            for cats in cat_lists:
+                ids = self.kg.ids(cats)
+                pr = self.prior[ids] if ids else np.array([np.nan])
+                v = self.kg.firm_vec(ids) if ids else np.zeros(EMB_DIM)
+                K.append([pr.mean(), pr.max(), pr.min(), self.kg.centrality[ids].mean() if ids else 0,
+                          self.kg.novelty(ids), *v])
+            K = pd.DataFrame(K, columns=["kg_prior_mean", "kg_prior_max", "kg_prior_min", "kg_centrality",
+                                         "kg_novelty"] + [f"kg_emb_{i}" for i in range(EMB_DIM)])
+            X = pd.concat([X, K], axis=1)
+        X.index = d.index if n == len(d) else range(n)
+        return X
+
+    def predict(self, d, cat_lists=None):
+        return self.clf.predict_proba(self.features(d, cat_lists)[self.cols])[:, 1]
+
+
+def prediction_ablation(train, test, kg):
+    """M1..M5: does knowledge improve discrimination? In-period CV vs temporal hold-out."""
+    specs = {"M1 Data only": (False, False, False), "M2 + raw categories": (True, False, False),
+             "M3 M2 + ontology": (True, True, False), "M4 M2 + KG": (True, False, True),
+             "M5 M2 + ontology + KG": (True, True, True)}
+    rows, models = [], {}
+    tr = train.reset_index(drop=True)
+    for name, use in specs.items():
+        m = SuccessModel(train, kg, *use)
+        models[name] = m
+        cv = []
+        for a, b in StratifiedKFold(5, shuffle=True, random_state=SEED).split(tr, tr["y"]):
+            mm = SuccessModel(tr.iloc[a], kg, *use)
+            cv.append(roc_auc_score(tr.iloc[b]["y"], mm.predict(tr.iloc[b])))
+        rows.append({"Model": name, "In-period AUC": np.mean(cv), "In-period SD": np.std(cv),
+                     "Hold-out AUC": roc_auc_score(test["y"], m.predict(test))})
+    return pd.DataFrame(rows), models
+
+
+# ----------------------------------------------------------------------------
+# Decision layer (3): success-aware recommendation, scored on realised outcomes
+# ----------------------------------------------------------------------------
+LAMBDAS = np.round(np.linspace(0, 1, 11), 2)
+
+
+def pct_rank(v):
+    """Percentile rank in [0,1] over finite entries (higher is better); -inf -> -1."""
+    out = np.full(len(v), -1.0)
+    f = np.isfinite(v)
+    out[f] = (v[f].argsort().argsort() + 1) / f.sum()
+    return out
+
+
+def recommend_eval(firms, peers_df, kg, ranker, model, rng):
+    """Score every strategy on realised outcomes of OTHER ventures in the same cohort.
+
+    For venture f and recommended category c, the realised uplift is the success-rate difference
+    between cohort peers (sharing >=1 category with f) that do and do not use c, shrunk by n/(n+SHRINK)."""
+    cols, kb = ranker
+    sets = [set(c) for c in peers_df["cats"]]
+    yv = peers_df["y"].values
+    pos = {ix: k for k, ix in enumerate(peers_df.index)}
+    by_cat = {}
+    for j, s in enumerate(sets):
+        for c in s:
+            by_cat.setdefault(c, set()).add(j)
+    out = {k: {"uplift": [], "support": [], "gain": [], "plaus_rank": []} for k in ["Popularity", *LAMBDAS]}
+    for ix, f in firms.iterrows():
+        ctx = kg.ids(f["cats"])
+        F = candidate_features(kg, ctx)
+        plaus = kb.decision_function(F[:, cols]); plaus[ctx] = -np.inf
+        prank = (-plaus).argsort().argsort() + 1
+        cand = np.where(np.isfinite(plaus))[0]
+        one = peers_df.loc[[ix]]
+        gains = np.full(len(kg.nodes), -np.inf)
+        gains[cand] = model.predict(one, [f["cats"] + [kg.nodes[c]] for c in cand]) - model.predict(one)[0]
+        peers = set().union(*[by_cat.get(c, set()) for c in f["cats"]]) - {pos[ix]}
+        pp, pg = pct_rank(plaus), pct_rank(gains)
+        pop = kg.freq.copy(); pop[ctx] = -np.inf
+        picks = {"Popularity": int(np.argmax(pop))}
+        for lam in LAMBDAS:
+            u = (1 - lam) * pp + lam * pg
+            u[ctx] = -np.inf
+            picks[lam] = int(np.argmax(u))
+        for k, c in picks.items():
+            w = peers & by_cat.get(kg.nodes[c], set())
+            wo = peers - w
+            upl = (yv[list(w)].mean() - yv[list(wo)].mean()) * len(w) / (len(w) + SHRINK) if w and wo else 0.0
+            out[k]["uplift"].append(float(upl)); out[k]["support"].append(len(w) >= MIN_PEERS)
+            out[k]["gain"].append(float(gains[c])); out[k]["plaus_rank"].append(int(prank[c]))
+    return {k: {m: np.array(v) for m, v in d.items()} for k, d in out.items()}
+
+
+def boot_ci(x, rng):
+    bs = [x[rng.integers(0, len(x), len(x))].mean() for _ in range(BOOT)]
+    return np.percentile(bs, [2.5, 97.5])
+
+
+def recommendation_table(res, lam_star, rng):
+    names = {"Popularity": "Popularity", 0.0: "Plausibility only (lambda = 0)", 1.0: "Success only (lambda = 1)",
+             lam_star: f"KB-DSS (lambda* = {lam_star:.1f})"}
+    ref = res[lam_star]["uplift"]
+    rows = []
+    for k, label in names.items():
+        r = res[k]
+        lo, hi = boot_ci(100 * r["uplift"], rng)
+        same = np.array_equal(r["uplift"], ref)
+        rows.append({"Strategy": label, "Future evidence (%)": 100 * r["support"].mean(),
+                     "Median plausibility rank": float(np.median(r["plaus_rank"])),
+                     "Predicted gain (pp)": 100 * r["gain"].mean(), "Realised uplift (pp)": 100 * r["uplift"].mean(),
+                     "Uplift 95% CI": f"[{lo:.2f}, {hi:.2f}]",
+                     "p vs KB-DSS": np.nan if k == lam_star or same else wilcoxon(ref, r["uplift"]).pvalue})
     return pd.DataFrame(rows)
 
 
-def recommend(firm, kg, prior, clf, cols, top_countries, n_candidates=20, top_k=3):
-    """Success-aware DT recommendation: KG-plausible categories re-ranked by predicted success gain."""
-    one = firm.to_frame().T.infer_objects()
-    one["cats"] = [firm["cats"]]
-    feats = lambda d: assemble(d, top_countries, kg, prior)[cols]
-    base = clf.predict_proba(feats(one))[0, 1]
-    v = kg.firm_vector(firm["cats"])
-    s = kg.E @ v
-    s[kg.ids(firm["cats"])] = -np.inf
-    cand = np.argsort(-s)[:n_candidates]
-    out = []
-    for c in cand:
-        alt = one.copy()
-        alt["cats"] = [firm["cats"] + [kg.nodes[c]]]
-        gain = clf.predict_proba(feats(alt))[0, 1] - base
-        out.append((kg.nodes[c], float(s[c]), float(gain)))
-    out.sort(key=lambda t: -t[2])
-    return base, out[:top_k]
-
-
-VOCAB: list[str] = []
-
-
-def assemble(df, top_countries, kg, prior, kg_block=None):
-    blocks = [base_features(df, top_countries), raw_category_features(df, VOCAB), ontology_features(df),
-              kg_block if kg_block is not None else kg_features(df, kg, prior)]
-    return pd.concat(blocks, axis=1)
-
-
-# --------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 # Figures
-# --------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 def figure_framework(path):
     import matplotlib.pyplot as plt
     from matplotlib.patches import FancyBboxPatch
-    fig, ax = plt.subplots(figsize=(10, 4.6))
-    ax.set_xlim(0, 10); ax.set_ylim(-0.05, 4.6); ax.axis("off")
-    col = {"data": "#dbe9f6", "know": "#fde7c8", "dec": "#d9f0d9"}
+    plt.rcParams.update({"font.family": "DejaVu Sans"})
+    fig, ax = plt.subplots(figsize=(11, 5.0))
+    ax.set_xlim(0, 11); ax.set_ylim(0, 5.0); ax.axis("off")
+    C = {"d": ("#e8f1fa", "#2b5c8a"), "k": ("#fdf0dc", "#a35f00"), "x": ("#e6f4e6", "#2e6b2e"), "o": ("#f3e8f7", "#6a3d7c")}
 
-    def box(x, y, w, h, title, body, c):
-        ax.add_patch(FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0.03,rounding_size=0.08",
-                                    fc=c, ec="#333", lw=1))
-        ax.text(x + w / 2, y + h - 0.22, title, ha="center", va="top", fontsize=9.5, weight="bold")
-        ax.text(x + w / 2, y + h - 0.55, body, ha="center", va="top", fontsize=8, linespacing=1.35)
+    def box(x, y, w, h, title, lines, kind, fs=8.6):
+        fc, ec = C[kind]
+        ax.add_patch(FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0.02,rounding_size=0.1", fc=fc, ec=ec, lw=1.3))
+        ax.text(x + w / 2, y + h - 0.2, title, ha="center", va="top", fontsize=9.8, weight="bold", color=ec)
+        ax.text(x + w / 2, y + h - 0.58, "\n".join(lines), ha="center", va="top", fontsize=fs, linespacing=1.45, color="#222")
 
-    def arrow(x1, y1, x2, y2):
-        ax.annotate("", (x2, y2), (x1, y1), arrowprops=dict(arrowstyle="-|>", lw=1.2, color="#333"))
+    def arr(p, q, c="#444", ls="-"):
+        ax.annotate("", q, p, arrowprops=dict(arrowstyle="-|>", lw=1.3, color=c, ls=ls, shrinkA=0, shrinkB=0))
 
-    ax.text(1.35, 4.45, "Data layer", ha="center", fontsize=10, weight="bold", color="#1f4e79")
-    ax.text(5.0, 4.45, "Knowledge layer", ha="center", fontsize=10, weight="bold", color="#9c5700")
-    ax.text(8.65, 4.45, "Decision layer", ha="center", fontsize=10, weight="bold", color="#2e6b2e")
-    box(0.1, 2.35, 2.5, 1.9, "Firm records", "Crunchbase export\nfirst funding round\nmarket categories\nlocation, timing", col["data"])
-    box(0.1, 0.25, 2.5, 1.8, "Data-only features", "round type and size\nfounding lag, year\ncountry, breadth", col["data"])
-    box(3.4, 2.35, 3.2, 1.9, "Expert DT ontology", "9 DT pillars mapped\nfrom market categories\nDT intensity, digital share\nAI x cloud, AI x platform", col["know"])
-    box(3.4, 0.25, 3.2, 1.8, "Category knowledge graph", "co-occurrence graph\nPPMI-SVD embeddings\nsuccess priors (out-of-fold)\nrecombinant novelty", col["know"])
-    box(7.4, 2.35, 2.5, 1.9, "Success prediction", "gradient-boosted\nclassifier with\nknowledge features", col["dec"])
-    box(7.4, 0.25, 2.5, 1.8, "DT recommendation", "KG-plausible options\nre-ranked by predicted\nsuccess gain", col["dec"])
-    arrow(2.6, 3.3, 3.4, 3.3)                     # records -> ontology
-    arrow(2.6, 2.6, 3.4, 1.7)                     # records -> knowledge graph
-    arrow(1.35, 2.35, 1.35, 2.05)                 # records -> data-only features
-    arrow(6.6, 3.3, 7.4, 3.3)                     # ontology -> prediction
-    arrow(6.6, 1.75, 7.4, 2.75)                   # KG -> prediction
-    arrow(6.6, 1.15, 7.4, 1.15)                   # KG -> recommendation
-    arrow(8.65, 2.35, 8.65, 2.05)                 # prediction -> recommendation
-    ax.plot([1.35, 1.35, 7.05, 7.05], [0.25, 0.08, 0.08, 2.55], color="#333", lw=1.2)
-    arrow(7.05, 2.55, 7.4, 2.55)                  # data-only features -> prediction (routed below)
-    fig.tight_layout()
-    fig.savefig(path, dpi=300)
-    plt.close(fig)
+    for x, t, k in [(1.2, "DATA LAYER", "d"), (4.25, "KNOWLEDGE LAYER", "k"), (8.55, "DECISION LAYER", "x")]:
+        ax.text(x, 4.75, t, ha="center", fontsize=10.5, weight="bold", color=C[k][1])
+    box(0.1, 2.65, 2.2, 1.8, "Venture records", ["Crunchbase export", "first funding round", "market categories",
+                                                  "location, timing"], "d")
+    box(0.1, 0.45, 2.2, 1.8, "Temporal protocol", ["KG \u2264 2008: fit ranker", "KG \u2264 2010: test",
+                                                    "2011-2015 outcomes", "used only for scoring"], "d")
+    box(2.9, 2.65, 2.7, 1.8, "Expert DT ontology", ["9 DT pillars from", "keyword patterns", "pillar overlap, lift Q(q|p)"], "k")
+    box(2.9, 0.45, 2.7, 1.8, "Category knowledge graph", ["transitions P(c|s), PPMI", "SVD embeddings",
+                                                         "out-of-fold success priors"], "k")
+    box(6.2, 2.65, 2.3, 1.8, "(1) Option generation", ["learned ranker over", "KG + ontology features", "\u2192 plausibility"], "x")
+    box(6.2, 0.45, 2.3, 1.8, "(2) Success estimation", ["gradient-boosted model", "data + knowledge", "\u2192 predicted gain"], "x")
+    box(9.05, 1.05, 1.85, 2.8, "(3) Recommend", ["U = (1\u2212\u03bb)\u00b7plaus.", "+ \u03bb\u00b7gain", "",
+                                                 "\u03bb* chosen on", "validation", "", "ranked DT moves", "per venture"], "o", fs=8.3)
+    arr((2.3, 3.55), (2.9, 3.55)); arr((2.3, 3.0), (2.9, 1.75))
+    arr((5.6, 3.55), (6.2, 3.55)); arr((5.6, 1.95), (6.2, 3.0)); arr((5.6, 1.35), (6.2, 1.35)); arr((5.6, 3.0), (6.2, 1.95))
+    ax.plot([2.3, 2.6, 2.6, 5.9, 5.9], [2.8, 2.8, 0.25, 0.25, 0.9], color="#2b5c8a", lw=1.2, ls="--")
+    arr((5.9, 0.9), (6.2, 0.9), c="#2b5c8a")
+    arr((8.5, 3.55), (9.05, 3.1)); arr((8.5, 1.35), (9.05, 1.8))
+    ax.text(9.97, 0.6, "knowledge proposes,\ndata disposes", ha="center", va="center", fontsize=8.6, style="italic", color="#6a3d7c")
+    fig.tight_layout(); fig.savefig(path, dpi=600); fig.savefig(path.replace(".png", ".pdf")); plt.close(fig)
 
 
-def figure_results(path, y, preds, groups_imp):
+def figure_results(path, ranks, rec, pred, lam_star):
     import matplotlib.pyplot as plt
-    fig, (a, b) = plt.subplots(1, 2, figsize=(10, 4.2))
-    styles = ["#9e9e9e", "#6baed6", "#fd8d3c", "#74c476", "#08519c"]
-    for (name, p), c in zip(preds.items(), styles):
-        fpr, tpr, _ = roc_curve(y, p)
-        a.plot(fpr, tpr, color=c, lw=1.8 if "KB-DSS" in name else 1.3, label=f"{name.split(' ')[0]} (AUC {roc_auc_score(y, p):.3f})")
-    a.plot([0, 1], [0, 1], ls=":", c="#999", lw=1)
-    a.set_xlabel("False positive rate"); a.set_ylabel("True positive rate")
-    a.set_title("(a) Temporal hold-out ROC (2011-2015 cohort)", fontsize=10)
-    a.legend(fontsize=7.2, loc="lower right", frameon=False)
-    g = groups_imp.sort_values("importance")
-    b.barh(g["group"], g["importance"], xerr=g["sd"], color=["#08519c" if "KG" in s else "#fd8d3c" if "ontology" in s.lower() else "#9e9e9e" for s in g["group"]], capsize=3)
-    b.set_xlabel("Drop in AUC when the feature group is permuted")
-    b.set_title("(b) Contribution of knowledge sources", fontsize=10)
-    b.tick_params(axis="y", labelsize=8)
-    fig.tight_layout()
-    fig.savefig(path, dpi=300)
-    plt.close(fig)
+    plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 8.5, "axes.spines.top": False, "axes.spines.right": False})
+    fig, (a, b, c) = plt.subplots(1, 3, figsize=(12, 3.9), gridspec_kw={"width_ratios": [1.15, 1.1, 1]})
+    col = {"Popularity": "#9e9e9e", "Co-occurrence": "#6baed6", "KG embedding": "#c6dbef", "Ontology ranker": "#fdae6b",
+           "KG ranker": "#4292c6", "KB-DSS ranker": "#08306b"}
+    ks = np.arange(1, 21)
+    for name, r in ranks.items():
+        a.plot(ks, [np.mean(r <= k) for k in ks], color=col[name], lw=2.4 if "KB-DSS" in name else 1.4,
+               marker="o" if "KB-DSS" in name else None, ms=3, label=name)
+    a.set_xlabel("k (options shown)"); a.set_ylabel("Hits@k (future move recovered)")
+    a.set_title("(a) Option generation, 2011-2015 ventures", fontsize=9.5, loc="left"); a.legend(frameon=False, fontsize=7.4)
+    a.set_xticks([1, 5, 10, 15, 20]); a.grid(alpha=.25)
+    lam = np.array(LAMBDAS)
+    real = np.array([100 * rec[l]["uplift"].mean() for l in LAMBDAS])
+    ci = np.array([boot_ci(100 * rec[l]["uplift"], RNG) for l in LAMBDAS])
+    predg = np.array([100 * rec[l]["gain"].mean() for l in LAMBDAS])
+    b.fill_between(lam, ci[:, 0], ci[:, 1], color="#08306b", alpha=.15, lw=0)
+    b.plot(lam, real, "-o", color="#08306b", ms=4, lw=2.2, label="Realised uplift, 2011-2015 (95% CI)")
+    b.set_ylim(3, 9.5)
+    b.set_ylabel("Realised success uplift (pp)", color="#08306b")
+    bb = b.twinx()
+    bb.plot(lam, predg, "--s", color="#e6550d", ms=3.5, lw=1.5, label="Model-predicted gain")
+    bb.set_ylim(0, 22); bb.set_ylabel("Model-predicted gain (pp)", color="#e6550d")
+    bb.spines["right"].set_visible(True); bb.tick_params(axis="y", colors="#e6550d")
+    b.axvline(lam_star, color="#2e6b2e", ls=":", lw=1.5)
+    b.annotate("\u03bb* = %.1f\n(validation)" % lam_star, (lam_star, 3.4), xytext=(lam_star - .36, 3.35), fontsize=7.3,
+               color="#2e6b2e", arrowprops=dict(arrowstyle="-", color="#2e6b2e", lw=.8))
+    b.set_xlabel("\u03bb   (0 = knowledge only,  1 = predicted success only)")
+    b.set_title("(b) Knowledge as a guardrail for recommendations", fontsize=9.5, loc="left")
+    h1, l1 = b.get_legend_handles_labels(); h2, l2 = bb.get_legend_handles_labels()
+    b.legend(h1 + h2, l1 + l2, frameon=False, fontsize=7.2, loc="upper left")
+    b.grid(alpha=.25)
+    x = np.arange(len(pred))
+    c.errorbar(x - .12, pred["In-period AUC"], yerr=pred["In-period SD"], fmt="o", color="#6baed6", capsize=3, label="In-period CV (\u22642010)")
+    c.plot(x + .12, pred["Hold-out AUC"], "s", color="#08306b", label="Temporal hold-out (2011-2015)")
+    c.set_xticks(x); c.set_xticklabels([m.split(" ")[0] for m in pred["Model"]]); c.set_ylabel("AUC")
+    c.set_title("(c) Success estimation and temporal drift", fontsize=9.5, loc="left"); c.legend(frameon=False, fontsize=7.2, loc="lower right")
+    c.grid(alpha=.25, axis="y")
+    fig.tight_layout(); fig.savefig(path, dpi=600); fig.savefig(path.replace(".png", ".pdf")); plt.close(fig)
 
 
-# --------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 # Experiment
-# --------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 def main():
-    global VOCAB
     os.makedirs(OUT, exist_ok=True)
     allf = load()
-    df = allf[allf["labeled"]].reset_index(drop=True)
-    train, test = df[df["year"] <= SPLIT_YEAR].copy(), df[df["year"] > SPLIT_YEAR].copy()
-    top_countries = train["country_code"].value_counts().head(8).index.tolist()
-    VOCAB = pd.Series([c for cs in train["cats"] for c in cs]).value_counts().head(100).index.tolist()
+    kg_val = CategoryKG(allf[allf["year"] <= KG_VAL]["cats"])            # knowledge available in 2008
+    kg = CategoryKG(allf[allf["year"] <= SPLIT]["cats"])                 # knowledge available in 2010
 
-    # The knowledge graph uses only categories (no outcomes) of ALL firms first funded up to the split year,
-    # including still-operating firms, so it carries no label information and no future information.
-    kg_source = allf[allf["year"] <= SPLIT_YEAR]["cats"]
-    kg = CategoryKG(kg_source)
-    prior_full = success_priors(train["cats"], train["y"].values, kg)
-    Xtr = assemble(train, top_countries, kg, None, kg_block=kg_features_oof(train, kg))
-    Xte = assemble(test, top_countries, kg, prior_full)
-    ytr, yte = train["y"].values, test["y"].values
-
-    base_cols = list(base_features(train.head(1), top_countries).columns)
-    raw_cols = [c for c in Xtr if c.startswith("cat_")]
-    ont_cols = [c for c in Xtr if c.startswith("pillar_")] + ["dt_intensity", "digital_share", "ai_x_cloud", "ai_x_platform"]
-    kg_cols = [c for c in Xtr if c.startswith("kg_")]
-    dd = base_cols + raw_cols
-    configs = {
-        "M1 Data only": base_cols,
-        "M2 Data-driven (M1 + raw categories)": dd,
-        "M3 M2 + DT ontology": dd + ont_cols,
-        "M4 M2 + category KG": dd + kg_cols,
-        "M5 KB-DSS (M2 + ontology + KG)": dd + ont_cols + kg_cols,
-    }
-
-    rows, preds, fitted = [], {}, {}
-    for name, cols in configs.items():
-        clf = model().fit(Xtr[cols], ytr)
-        p = clf.predict_proba(Xte[cols])[:, 1]
-        preds[name], fitted[name] = p, clf
-        lo, hi = boot_ci(yte, p, roc_auc_score)
-        rows.append({"Model": name, "Features": len(cols), "AUC": roc_auc_score(yte, p), "AUC 95% CI": f"[{lo:.3f}, {hi:.3f}]",
-                     "PR-AUC": average_precision_score(yte, p), "Brier": brier_score_loss(yte, p)})
-    t1 = pd.DataFrame(rows)
-
-    # In-period reference: 5-fold CV inside the training cohort (same era, no temporal shift)
-    skf = StratifiedKFold(5, shuffle=True, random_state=SEED)
-    cv = {n: [] for n in configs}
-    tr_r = train.reset_index(drop=True)
-    Xtr_r = Xtr.reset_index(drop=True)
-    for a, b in skf.split(tr_r, tr_r["y"]):
-        A, Bf = tr_r.iloc[a], tr_r.iloc[b]
-        Xa = Xtr_r.iloc[a].copy(); Xb = Xtr_r.iloc[b].copy()
-        Xa[kg_cols] = kg_features_oof(A, kg)[kg_cols].values
-        Xb[kg_cols] = kg_features(Bf, kg, success_priors(A["cats"], A["y"].values, kg))[kg_cols].values
-        for name, cols in configs.items():
-            m = model().fit(Xa[cols], A["y"])
-            cv[name].append(roc_auc_score(Bf["y"], m.predict_proba(Xb[cols])[:, 1]))
-    t1.insert(2, "In-period CV AUC", [f"{np.mean(cv[n]):.3f} +/- {np.std(cv[n]):.3f}" for n in configs])
-    full = "M5 KB-DSS (M2 + ontology + KG)"
-    ref = "M2 Data-driven (M1 + raw categories)"
-    for name in configs:
-        if name != ref:
-            d, pval = paired_delta(yte, preds[name], preds[ref])
-            t1.loc[t1["Model"] == name, "dAUC vs M2"] = f"{d:+.4f}"
-            t1.loc[t1["Model"] == name, "p (bootstrap)"] = round(pval, 3)
-    t1.to_csv(f"{OUT}/table1_prediction.csv", index=False)
-
-    # Grouped permutation importance of the full model
-    clf, cols = fitted[full], configs[full]
+    # (1) option generation: train on 2009-2010 ventures, test on 2011-2015 ventures (all statuses)
     rng = np.random.default_rng(SEED)
-    base_auc = roc_auc_score(yte, preds[full])
-    groups = {"Data: raw categories": raw_cols, "Data: funding round": [c for c in base_cols if c.startswith("round_") or "first_round" in c],
-              "Data: timing": ["first_year", "lag_years"], "Data: location": [c for c in base_cols if c.startswith("country_")],
-              "DT ontology: pillars": [c for c in ont_cols if c.startswith("pillar_")],
-              "DT ontology: intensity/share": ["dt_intensity", "digital_share", "ai_x_cloud", "ai_x_platform", "n_categories"],
-              "KG: success priors": ["kg_prior_mean", "kg_prior_max", "kg_prior_min"],
-              "KG: embeddings": [c for c in kg_cols if c.startswith("kg_emb_")],
-              "KG: novelty/centrality": ["kg_novelty", "kg_centrality", "kg_coverage"]}
-    imp = []
-    for gname, gcols in groups.items():
-        drops = []
-        for _ in range(10):
-            Xp = Xte[cols].copy()
-            perm = rng.permutation(len(Xp))
-            Xp[gcols] = Xp[gcols].values[perm]
-            drops.append(base_auc - roc_auc_score(yte, clf.predict_proba(Xp)[:, 1]))
-        imp.append({"group": gname, "importance": np.mean(drops), "sd": np.std(drops)})
-    imp = pd.DataFrame(imp)
-    imp.to_csv(f"{OUT}/permutation_importance.csv", index=False)
+    rankers = train_rankers(kg_val, hide_one(allf[(allf["year"] > KG_VAL) & (allf["year"] <= SPLIT)], kg_val, rng), rng)
+    test_cases = hide_one(allf[allf["year"] > SPLIT], kg, np.random.default_rng(SEED + 1))
+    t1, ranks = completion_benchmark(kg, test_cases, rankers)
+    coefs = {n: dict(zip([FEAT_NAMES[i] for i in cols], m[-1].coef_[0].round(3))) for n, (cols, m) in rankers.items()}
 
-    # Knowledge-graph completion (plausibility of DT options)
-    t2 = kg_completion(test, kg, kg.freq)
-    t2.to_csv(f"{OUT}/table2_kg_completion.csv", index=False)
+    # (2) success estimation: labelled ventures, temporal hold-out
+    lab = allf[allf["labeled"]]
+    train, test = lab[lab["year"] <= SPLIT].copy(), lab[lab["year"] > SPLIT].copy()
+    pred, models = prediction_ablation(train, test, kg)
 
-    # Pillar-level descriptive knowledge (train cohort)
-    O = ontology_features(train)
-    pill = pd.DataFrame([{"pillar": p, "share_of_firms": O[f"pillar_{p}"].mean(),
-                          "success_rate": train["y"][O[f"pillar_{p}"] == 1].mean()} for p in PILLARS])
-    pill.to_csv(f"{OUT}/pillar_summary.csv", index=False)
+    # (3) recommendation: choose lambda on the 2009-2010 validation cohort, then test once on 2011-2015
+    val_train = lab[lab["year"] <= KG_VAL]
+    val_cohort = lab[(lab["year"] > KG_VAL) & (lab["year"] <= SPLIT)]
+    val_model = SuccessModel(val_train, kg_val, True, True, True)
+    val_firms = val_cohort[val_cohort["cats"].apply(lambda c: len(kg_val.ids(c)) >= 1)]
+    val_firms = val_firms.sample(min(N_REC, len(val_firms)), random_state=SEED)
+    val_rankers = rankers  # ranker weights were fitted with the 2008 KG on 2009-2010 ventures
+    val = recommend_eval(val_firms, val_cohort, kg_val, val_rankers["KB-DSS ranker"], val_model, rng)
+    val_curve = {float(l): float(val[l]["uplift"].mean()) for l in LAMBDAS}
+    lam_star = float(max(LAMBDAS, key=lambda l: (round(val_curve[float(l)], 6), -l)))
+    test_firms = test[test["cats"].apply(lambda c: len(kg.ids(c)) >= 1)].sample(N_REC, random_state=SEED)
+    rec = recommend_eval(test_firms, test, kg, rankers["KB-DSS ranker"], models["M5 M2 + ontology + KG"], rng)
+    t2 = recommendation_table(rec, lam_star, rng)
+    sweep = pd.DataFrame([{"lambda": l, "validation_uplift_pp": 100 * val_curve[float(l)],
+                           "test_uplift_pp": 100 * rec[l]["uplift"].mean(), "test_predicted_gain_pp": 100 * rec[l]["gain"].mean(),
+                           "test_future_evidence_pct": 100 * rec[l]["support"].mean()} for l in LAMBDAS])
+    sweep.to_csv(f"{OUT}/lambda_sweep.csv", index=False)
+    n_rec = len(test_firms)
 
-    # Success-aware recommendations for closed firms in the test cohort
-    closed = test[test["y"] == 0]
-    sample = closed.sample(300, random_state=SEED)
-    gains, rand_gains, top_examples = [], [], []
-    rng2 = np.random.default_rng(SEED)
-    feats = lambda d: assemble(d, top_countries, kg, prior_full)[cols]
-    for _, f in sample.iterrows():
-        base_p, recs = recommend(f, kg, prior_full, clf, cols, top_countries)
-        gains.append(recs[0][2])
-        one = f.to_frame().T.infer_objects()
-        pool = [c for c in kg.nodes if c not in f["cats"]]
-        alts = []
-        for c in rng2.choice(pool, 3, replace=False):          # control: add a random KG category
-            alt = one.copy(); alt["cats"] = [f["cats"] + [c]]; alts.append(alt)
-        pr = clf.predict_proba(feats(pd.concat(alts)))[:, 1]
-        rand_gains.append(float(pr.max() - base_p))
-        if len(top_examples) < 3 and len(f["cats"]) >= 2:
-            top_examples.append({"firm_categories": f["cats"], "predicted_success": round(base_p, 3),
-                                 "recommendations": [{"add": r[0], "kg_plausibility": round(r[1], 3), "predicted_gain": round(r[2], 3)} for r in recs]})
-    rec_summary = {"n_firms": len(sample), "mean_top1_predicted_gain": float(np.mean(gains)),
-                   "control_random_best_of_3_mean_gain": float(np.mean(rand_gains)),
-                   "share_kbdss_beats_control": float(np.mean(np.array(gains) > np.array(rand_gains))),
-                   "median_top1_predicted_gain": float(np.median(gains)), "share_positive_gain": float(np.mean(np.array(gains) > 0)),
-                   "examples": top_examples}
-
-    summary = {"n_firms": len(df), "n_train": len(train), "n_test": len(test),
-               "success_rate_train": float(ytr.mean()), "success_rate_test": float(yte.mean()),
-               "kg_nodes": len(kg.nodes), "kg_edges": kg.n_edges, "ontology_pillars": len(PILLARS),
-               "ontology_coverage_categories": float(np.mean([bool(pillars_of(c)) for c in kg.nodes])),
-               "recommendation": rec_summary}
-    with open(f"{OUT}/summary.json", "w") as fh:
-        json.dump(summary, fh, indent=2)
-
+    t1.to_csv(f"{OUT}/table1_option_generation.csv", index=False)
+    t2.to_csv(f"{OUT}/table2_recommendation.csv", index=False)
+    pred.to_csv(f"{OUT}/prediction_ablation.csv", index=False)
+    summary = {"ventures_total": len(allf), "kg_2008": {"nodes": len(kg_val.nodes), "edges": kg_val.n_edges},
+               "kg_2010": {"nodes": len(kg.nodes), "edges": kg.n_edges,
+                           "source_ventures": int((allf["year"] <= SPLIT).sum()),
+                           "ontology_coverage": float(kg.Pi.any(1).mean())},
+               "ranker_train_cases": int(sum(1 for _ in hide_one(allf[(allf["year"] > KG_VAL) & (allf["year"] <= SPLIT)], kg_val, np.random.default_rng(SEED)))),
+               "completion_test_cases": len(test_cases), "labelled_train": len(train), "labelled_test": len(test),
+               "success_rate_train": float(train["y"].mean()), "success_rate_test": float(test["y"].mean()),
+               "recommendation_ventures": n_rec, "lambda_star": lam_star, "ranker_coefficients": coefs}
+    json.dump(summary, open(f"{OUT}/summary.json", "w"), indent=2)
     figure_framework(f"{OUT}/Figure_1.png")
-    figure_results(f"{OUT}/Figure_2.png", yte, preds, imp)
-    pd.set_option("display.width", 200)
-    print(t1.round(4).to_string(index=False), "\n")
-    print(t2.round(4).to_string(index=False), "\n")
-    print(imp.round(4).to_string(index=False), "\n")
-    print(pill.round(3).to_string(index=False), "\n")
+    figure_results(f"{OUT}/Figure_2.png", ranks, rec, pred, lam_star)
+    pd.set_option("display.width", 220)
+    for t in (t1, t2, pred, sweep):
+        print(t.round(4).to_string(index=False), "\n")
     print(json.dumps(summary, indent=2))
 
 

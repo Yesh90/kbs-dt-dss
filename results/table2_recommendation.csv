@@ -1,0 +1,5 @@
+Strategy,Future evidence (%),Median plausibility rank,Predicted gain (pp),Realised uplift (pp),Uplift 95% CI,p vs KB-DSS
+Popularity,62.7,8.0,4.322650036131508,4.701065208905784,"[4.19, 5.18]",4.565203113811817e-13
+Plausibility only (lambda = 0),87.3,1.0,4.946242857889129,6.541216478740257,"[5.79, 7.27]",0.08026414052019659
+Success only (lambda = 1),33.4,76.0,19.73147626156151,5.940752005387575,"[5.44, 6.51]",1.1517028897111019e-05
+KB-DSS (lambda* = 0.6),62.8,11.0,15.349565192860762,7.303895925506105,"[6.68, 7.90]",
