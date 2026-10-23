@@ -1,6 +1,6 @@
-# KB-DSS: Knowledge-Based AI Decision Support for Digital Transformation in Entrepreneurial Firms
+# KB-DSS: Knowledge Proposes, Data Disposes
 
-Code and results for the short communication *"A Knowledge-Based AI Decision Support System for Data-Driven Digital Transformation and Innovation in Entrepreneurial Firms"* (submitted to *Knowledge-Based Systems*).
+Code and results for the manuscript *"Knowledge Proposes, Data Disposes: A Knowledge-Based AI Decision Support System for Digital Transformation and Innovation in Entrepreneurial Firms"* (submitted to *Knowledge-Based Systems*).
 
 **Principle: knowledge proposes, data disposes.** A knowledge layer proposes digital-transformation (DT) moves that are plausible for a venture; a data layer estimates how much each move would raise the venture's chance of success; a single trade-off weight λ, chosen on a validation cohort, combines the two.
 
@@ -21,8 +21,8 @@ The script downloads the data on first run (about 30 MB), runs every experiment 
 
 | Output | Paper |
 |---|---|
-| `results/table1_option_generation.csv` | Table 1, option generation on 2011–2015 ventures |
-| `results/table2_recommendation.csv` | Table 2, recommendations scored on realised outcomes |
+| `results/table1_option_generation.csv` | Section 4.1, option-generation results on 2011–2015 ventures |
+| `results/table2_recommendation.csv` | Section 4.2, recommendations scored on realised outcomes |
 | `results/Figure_1.png` / `.pdf` | Fig. 1, KB-DSS architecture |
 | `results/Figure_2.png` / `.pdf` | Fig. 2, (a) Hits@k, (b) λ trade-off, (c) temporal drift |
 | `results/lambda_sweep.csv`, `results/prediction_ablation.csv`, `results/summary.json` | Numbers quoted in the text |
@@ -41,6 +41,6 @@ The data are the December 2015 Crunchbase export as mirrored at [notpeter/crunch
 ## Citation
 
 ```
-S.Y.R. Ravula, A Knowledge-Based AI Decision Support System for Data-Driven Digital Transformation
-and Innovation in Entrepreneurial Firms, manuscript submitted to Knowledge-Based Systems, 2026.
+S.Y.R. Ravula, Knowledge Proposes, Data Disposes: A Knowledge-Based AI Decision Support System for
+Digital Transformation and Innovation in Entrepreneurial Firms, manuscript submitted to Knowledge-Based Systems, 2026.
 ```
