@@ -17,9 +17,9 @@ Principle: knowledge generates plausible options; data ranks them by expected su
 Protocol (no look-ahead anywhere):
   ranker   trained on ventures first funded 2009-2010 with a KG built from <=2008
   models   success model trained on labelled ventures first funded <=2010
-  test     ventures first funded 2011-2015 with a KG built from <=2010
+  test     ventures first funded 2011–2015 with a KG built from <=2010
   outcome  recommendations are scored against REALISED outcomes of other
-           2011-2015 ventures (never used for training)
+           2011–2015 ventures (never used for training)
 
 Run:  python kbdss.py          (downloads data on first run, writes results/)
 """
@@ -137,9 +137,9 @@ class CategoryKG:
         A = sparse.coo_matrix((np.ones(len(rows)), (rows, cols)), shape=(n, n)).toarray()
         self.A, self.n_edges = A, int((A > 0).sum() // 2)
         deg = A.sum(1)
-        self.cond = A / np.maximum(deg, 1)[:, None]                         # P(c | s), Eq. (1)
+        self.cond = A / np.maximum(deg, 1)[:, None]                         # transition probability P(c | s)
         pmi = np.log(np.maximum(A * A.sum(), 1e-12) / np.maximum(np.outer(deg, deg), 1e-12))
-        self.ppmi = np.where(A > 0, np.maximum(pmi, 0), 0.0)                 # Eq. (2)
+        self.ppmi = np.where(A > 0, np.maximum(pmi, 0), 0.0)                 # positive pointwise mutual information
         E = TruncatedSVD(dim, random_state=SEED).fit_transform(sparse.csr_matrix(self.ppmi))
         self.E = E / (np.linalg.norm(E, axis=1, keepdims=True) + 1e-12)
         self.centrality = deg / max(deg.max(), 1)
@@ -438,7 +438,7 @@ def figure_framework(path):
     box(0.1, 2.65, 2.2, 1.8, "Venture records", ["Crunchbase export", "first funding round", "market categories",
                                                   "location, timing"], "d")
     box(0.1, 0.45, 2.2, 1.8, "Temporal protocol", ["KG \u2264 2008: fit ranker", "KG \u2264 2010: test",
-                                                    "2011-2015 outcomes", "used only for scoring"], "d")
+                                                    "2011–2015 outcomes", "used only for scoring"], "d")
     box(2.9, 2.65, 2.7, 1.8, "Expert DT ontology", ["9 DT pillars from", "keyword patterns", "pillar overlap, lift Q(q|p)"], "k")
     box(2.9, 0.45, 2.7, 1.8, "Category knowledge graph", ["transitions P(c|s), PPMI", "SVD embeddings",
                                                          "out-of-fold success priors"], "k")
@@ -465,14 +465,14 @@ def figure_results(path, ranks, rec, pred, lam_star):
         a.plot(ks, [np.mean(r <= k) for k in ks], color=col[name], lw=2.4 if "KB-DSS" in name else 1.4,
                marker="o" if "KB-DSS" in name else None, ms=3, label=name)
     a.set_xlabel("k (options shown)"); a.set_ylabel("Hits@k (future move recovered)")
-    a.set_title("(a) Option generation, 2011-2015 ventures", fontsize=9.5, loc="left"); a.legend(frameon=False, fontsize=7.4)
+    a.set_title("(a) Option generation, 2011–2015 ventures", fontsize=9.5, loc="left"); a.legend(frameon=False, fontsize=7.4)
     a.set_xticks([1, 5, 10, 15, 20]); a.grid(alpha=.25)
     lam = np.array(LAMBDAS)
     real = np.array([100 * rec[l]["uplift"].mean() for l in LAMBDAS])
     ci = np.array([boot_ci(100 * rec[l]["uplift"], RNG) for l in LAMBDAS])
     predg = np.array([100 * rec[l]["gain"].mean() for l in LAMBDAS])
     b.fill_between(lam, ci[:, 0], ci[:, 1], color="#08306b", alpha=.15, lw=0)
-    b.plot(lam, real, "-o", color="#08306b", ms=4, lw=2.2, label="Realised uplift, 2011-2015 (95% CI)")
+    b.plot(lam, real, "-o", color="#08306b", ms=4, lw=2.2, label="Realised uplift, 2011–2015 (95% CI)")
     b.set_ylim(3, 9.5)
     b.set_ylabel("Realised success uplift (pp)", color="#08306b")
     bb = b.twinx()
@@ -489,7 +489,7 @@ def figure_results(path, ranks, rec, pred, lam_star):
     b.grid(alpha=.25)
     x = np.arange(len(pred))
     c.errorbar(x - .12, pred["In-period AUC"], yerr=pred["In-period SD"], fmt="o", color="#6baed6", capsize=3, label="In-period CV (\u22642010)")
-    c.plot(x + .12, pred["Hold-out AUC"], "s", color="#08306b", label="Temporal hold-out (2011-2015)")
+    c.plot(x + .12, pred["Hold-out AUC"], "s", color="#08306b", label="Temporal hold-out (2011–2015)")
     c.set_xticks(x); c.set_xticklabels([m.split(" ")[0] for m in pred["Model"]]); c.set_ylabel("AUC")
     c.set_title("(c) Success estimation and temporal drift", fontsize=9.5, loc="left"); c.legend(frameon=False, fontsize=7.2, loc="lower right")
     c.grid(alpha=.25, axis="y")
@@ -505,7 +505,7 @@ def main():
     kg_val = CategoryKG(allf[allf["year"] <= KG_VAL]["cats"])            # knowledge available in 2008
     kg = CategoryKG(allf[allf["year"] <= SPLIT]["cats"])                 # knowledge available in 2010
 
-    # (1) option generation: train on 2009-2010 ventures, test on 2011-2015 ventures (all statuses)
+    # (1) option generation: train on 2009-2010 ventures, test on 2011–2015 ventures (all statuses)
     rng = np.random.default_rng(SEED)
     rankers = train_rankers(kg_val, hide_one(allf[(allf["year"] > KG_VAL) & (allf["year"] <= SPLIT)], kg_val, rng), rng)
     test_cases = hide_one(allf[allf["year"] > SPLIT], kg, np.random.default_rng(SEED + 1))
@@ -517,7 +517,7 @@ def main():
     train, test = lab[lab["year"] <= SPLIT].copy(), lab[lab["year"] > SPLIT].copy()
     pred, models = prediction_ablation(train, test, kg)
 
-    # (3) recommendation: choose lambda on the 2009-2010 validation cohort, then test once on 2011-2015
+    # (3) recommendation: choose lambda on the 2009-2010 validation cohort, then test once on 2011–2015
     val_train = lab[lab["year"] <= KG_VAL]
     val_cohort = lab[(lab["year"] > KG_VAL) & (lab["year"] <= SPLIT)]
     val_model = SuccessModel(val_train, kg_val, True, True, True)
