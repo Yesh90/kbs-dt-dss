@@ -22,9 +22,9 @@ The script downloads the data on first run (about 30 MB), runs every experiment 
 | Output | Paper |
 |---|---|
 | `results/table1_option_generation.csv` | Section 4.1, option-generation results on 2011–2015 ventures |
-| `results/table2_recommendation.csv` | Section 4.2, recommendations scored on realised outcomes |
-| `results/Figure_1.png` / `.pdf` | Supplementary: KB-DSS architecture (described in Section 2) |
-| `results/Figure_2.png` / `.pdf` | Supplementary: Hits@k, λ trade-off and temporal drift (reported numerically in Section 4) |
+| `results/Figure_2.png` / `.pdf` | Fig. 1 in the paper: (a) Hits@k, (b) λ trade-off, (c) temporal drift |
+| `results/table2_recommendation.csv` | Table 1 in the paper |
+| `results/Figure_1.png` / `.pdf` | Supplementary: KB-DSS architecture diagram |
 | `results/lambda_sweep.csv`, `results/prediction_ablation.csv`, `results/summary.json` | Numbers quoted in the text |
 
 ## Evaluation protocol (no look-ahead)
