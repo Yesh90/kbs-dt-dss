@@ -31,7 +31,7 @@ The script downloads the data on first run (about 30 MB), runs every experiment 
 
 - **Option generation:** the ranker is fitted on ventures first funded in 2009–2010 using a knowledge graph built only from ventures funded up to 2008. It is tested on ventures first funded in 2011–2015 (one category hidden per venture) with a knowledge graph built up to 2010.
 - **Success estimation:** trained on labelled ventures (acquired/IPO = success, closed = failure) first funded up to 2010 and tested on 2011–2015. Only first-round information is used.
-- **Recommendation:** λ is selected on the 2009–2010 validation cohort and applied once to the 2011–2015 cohort. Each recommendation is scored against the **realised** outcomes of other 2011–2015 ventures that share a category with the target venture (success-rate difference with vs. without the recommended category, shrunk by n/(n+10)). These outcomes are never used for training.
+- **Recommendation:** λ is selected on the 2009–2010 validation cohort and applied once to the 2011–2015 cohort. Each recommendation is scored against the **realized** outcomes of other 2011–2015 ventures that share a category with the target venture (success-rate difference with vs. without the recommended category, shrunk by n/(n+10)). These outcomes are never used for training.
 - **Statistics:** Wilcoxon signed-rank tests on matched ventures and 1,000-sample bootstrap 95% confidence intervals.
 
 ## Data and license

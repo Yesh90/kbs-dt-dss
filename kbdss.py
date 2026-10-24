@@ -18,7 +18,7 @@ Protocol (no look-ahead anywhere):
   ranker   trained on ventures first funded 2009-2010 with a KG built from <=2008
   models   success model trained on labelled ventures first funded <=2010
   test     ventures first funded 2011–2015 with a KG built from <=2010
-  outcome  recommendations are scored against REALISED outcomes of other
+  outcome  recommendations are scored against REALIZED outcomes of other
            2011–2015 ventures (never used for training)
 
 Run:  python kbdss.py          (downloads data on first run, writes results/)
@@ -48,7 +48,7 @@ SEED = 42
 KG_VAL, SPLIT = 2008, 2010     # KG cut-off for ranker training; train/test split year
 EMB_DIM, MIN_CAT, PRIOR_M = 32, 10, 20
 N_NEG, N_REC = 30, 1000            # ranker negatives, ventures per recommendation benchmark
-MIN_PEERS, SHRINK = 5, 10           # realised-uplift support threshold and shrinkage
+MIN_PEERS, SHRINK = 5, 10           # realized-uplift support threshold and shrinkage
 BOOT = 1000
 URL = "https://raw.githubusercontent.com/notpeter/crunchbase-data/master/{}.csv"
 DATA, OUT = "data", "results"
@@ -338,7 +338,7 @@ def prediction_ablation(train, test, kg):
 
 
 # ----------------------------------------------------------------------------
-# Decision layer (3): success-aware recommendation, scored on realised outcomes
+# Decision layer (3): success-aware recommendation, scored on realized outcomes
 # ----------------------------------------------------------------------------
 LAMBDAS = np.round(np.linspace(0, 1, 11), 2)
 
@@ -352,9 +352,9 @@ def pct_rank(v):
 
 
 def recommend_eval(firms, peers_df, kg, ranker, model, rng):
-    """Score every strategy on realised outcomes of OTHER ventures in the same cohort.
+    """Score every strategy on realized outcomes of OTHER ventures in the same cohort.
 
-    For venture f and recommended category c, the realised uplift is the success-rate difference
+    For venture f and recommended category c, the realized uplift is the success-rate difference
     between cohort peers (sharing >=1 category with f) that do and do not use c, shrunk by n/(n+SHRINK)."""
     cols, kb = ranker
     sets = [set(c) for c in peers_df["cats"]]
@@ -407,7 +407,7 @@ def recommendation_table(res, lam_star, rng):
         same = np.array_equal(r["uplift"], ref)
         rows.append({"Strategy": label, "Future evidence (%)": 100 * r["support"].mean(),
                      "Median plausibility rank": float(np.median(r["plaus_rank"])),
-                     "Predicted gain (pp)": 100 * r["gain"].mean(), "Realised uplift (pp)": 100 * r["uplift"].mean(),
+                     "Predicted gain (pp)": 100 * r["gain"].mean(), "Realized uplift (pp)": 100 * r["uplift"].mean(),
                      "Uplift 95% CI": f"[{lo:.2f}, {hi:.2f}]",
                      "p vs KB-DSS": np.nan if k == lam_star or same else wilcoxon(ref, r["uplift"]).pvalue})
     return pd.DataFrame(rows)
@@ -472,9 +472,9 @@ def figure_results(path, ranks, rec, pred, lam_star):
     ci = np.array([boot_ci(100 * rec[l]["uplift"], RNG) for l in LAMBDAS])
     predg = np.array([100 * rec[l]["gain"].mean() for l in LAMBDAS])
     b.fill_between(lam, ci[:, 0], ci[:, 1], color="#08306b", alpha=.15, lw=0)
-    b.plot(lam, real, "-o", color="#08306b", ms=4, lw=2.2, label="Realised uplift, 2011–2015 (95% CI)")
+    b.plot(lam, real, "-o", color="#08306b", ms=4, lw=2.2, label="Realized uplift, 2011–2015 (95% CI)")
     b.set_ylim(3, 9.5)
-    b.set_ylabel("Realised success uplift (pp)", color="#08306b")
+    b.set_ylabel("Realized success uplift (pp)", color="#08306b")
     bb = b.twinx()
     bb.plot(lam, predg, "--s", color="#e6550d", ms=3.5, lw=1.5, label="Model-predicted gain")
     bb.set_ylim(0, 22); bb.set_ylabel("Model-predicted gain (pp)", color="#e6550d")
