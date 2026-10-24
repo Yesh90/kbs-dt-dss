@@ -2,7 +2,7 @@
 KB-DSS: a knowledge-based AI decision support system for data-driven
 digital transformation (DT) and innovation in entrepreneurial firms.
 
-Principle: knowledge proposes, data disposes.
+Principle: knowledge generates plausible options; data ranks them by expected success.
   Data layer       venture records from the public Crunchbase 2015 export
   Knowledge layer  (a) expert DT ontology: market categories -> 9 DT pillars
                    (b) category knowledge graph (KG) learned from co-occurrence:
@@ -451,7 +451,6 @@ def figure_framework(path):
     ax.plot([2.3, 2.6, 2.6, 5.9, 5.9], [2.8, 2.8, 0.25, 0.25, 0.9], color="#2b5c8a", lw=1.2, ls="--")
     arr((5.9, 0.9), (6.2, 0.9), c="#2b5c8a")
     arr((8.5, 3.55), (9.05, 3.1)); arr((8.5, 1.35), (9.05, 1.8))
-    ax.text(9.97, 0.6, "knowledge proposes,\ndata disposes", ha="center", va="center", fontsize=8.6, style="italic", color="#6a3d7c")
     fig.tight_layout(); fig.savefig(path, dpi=600); fig.savefig(path.replace(".png", ".pdf")); plt.close(fig)
 
 

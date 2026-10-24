@@ -1,8 +1,8 @@
-# KB-DSS: Knowledge Proposes, Data Disposes
+# KB-DSS: Knowledge-Based AI Decision Support for Digital Transformation in Entrepreneurial Firms
 
-Code and results for the manuscript *"Knowledge Proposes, Data Disposes: A Knowledge-Based AI Decision Support System for Digital Transformation and Innovation in Entrepreneurial Firms"* (submitted to *Knowledge-Based Systems*).
+Code and results for the manuscript *"A Knowledge-Based AI Decision Support System Combining Knowledge Graphs and Data-Driven Success Prediction to Guide Digital Transformation and Innovation in Entrepreneurial Firms"* (submitted to *Knowledge-Based Systems*).
 
-**Principle: knowledge proposes, data disposes.** A knowledge layer proposes digital-transformation (DT) moves that are plausible for a venture; a data layer estimates how much each move would raise the venture's chance of success; a single trade-off weight λ, chosen on a validation cohort, combines the two.
+**Principle:** a knowledge layer generates digital-transformation (DT) moves that are plausible for a venture; a data layer estimates how much each move would raise the venture's chance of success; a single trade-off weight λ, chosen on a validation cohort, combines the two.
 
 | Layer | Component |
 |---|---|
@@ -41,6 +41,5 @@ The data are the December 2015 Crunchbase export as mirrored at [notpeter/crunch
 ## Citation
 
 ```
-S.Y.R. Ravula, Knowledge Proposes, Data Disposes: A Knowledge-Based AI Decision Support System for
-Digital Transformation and Innovation in Entrepreneurial Firms, manuscript submitted to Knowledge-Based Systems, 2026.
+S.Y.R. Ravula, A Knowledge-Based AI Decision Support System Combining Knowledge Graphs and Data-Driven Success Prediction to Guide Digital Transformation and Innovation in Entrepreneurial Firms, manuscript submitted to Knowledge-Based Systems, 2026.
 ```
